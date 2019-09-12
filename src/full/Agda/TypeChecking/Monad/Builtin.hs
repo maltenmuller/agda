@@ -142,10 +142,19 @@ getTerm use name = flip fromMaybeM (getTerm' name) $
 
 
 -- | Rewrite a literal to constructor form if possible.
-constructorForm :: (HasBuiltins m, MonadError TCErr m, MonadTCEnv m, ReadTCState m)
-                => Term -> m Term
-constructorForm v = constructorForm' primZero primSuc v
+constructorForm :: (HasBuiltins m, MonadTCEnv m, ReadTCState m) => Term -> m Term
+constructorForm v =
+  case v of
+    Lit (LitNat r n)
+      | n == 0    -> fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinZero
+      | n > 0     -> do
+        suc <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinSuc
+        return $ suc `apply1` Lit (LitNat r $ n - 1)
+      | otherwise -> pure v
+    Lit (LitTerm _ q) -> quotedTermConstructorForm q
+    _ -> pure v
 
+-- | Caution: Only does natural numbers!
 constructorForm' :: Applicative m => m Term -> m Term -> Term -> m Term
 constructorForm' pZero pSuc v =
   case v of
@@ -154,6 +163,118 @@ constructorForm' pZero pSuc v =
       | n > 0     -> (`apply1` Lit (LitNat r $ n - 1)) <$> pSuc
       | otherwise -> pure v
     _ -> pure v
+
+data QuotedTermKit = QuotedTermKit
+  { qkitHidden, qkitInstance, qkitVisible :: Term
+  , qkitRelevant, qkitIrrelevant          :: Term
+  , qkitArg, qkitArgInfo                  :: Term
+  , qkitNil, qkitCons                     :: Term
+  , qkitVar, qkitDef, qkitCon, qkitMeta   :: Term
+  , qkitLam, qkitExtLam, qkitPi, qkitSort :: Term }
+
+getQuotedTermKit :: (HasBuiltins m, MonadTCEnv m, ReadTCState m, MonadError TCErr m) => m QuotedTermKit
+getQuotedTermKit = do
+  qkitHidden     <- primHidden
+  qkitInstance   <- primInstance
+  qkitVisible    <- primVisible
+  qkitRelevant   <- primRelevant
+  qkitIrrelevant <- primIrrelevant
+  qkitArg        <- primArgArg
+  qkitArgInfo    <- primArgArgInfo
+  qkitNil        <- primNil
+  qkitCons       <- primCons
+  qkitVar        <- primAgdaTermVar
+  qkitDef        <- primAgdaTermDef
+  qkitCon        <- primAgdaTermCon
+  qkitMeta       <- primAgdaTermMeta
+  qkitLam        <- primAgdaTermLam
+  qkitExtLam     <- primAgdaTermExtLam
+  qkitPi         <- primAgdaTermPi
+  qkitSort       <- primAgdaTermSort
+  pure QuotedTermKit{..}
+
+getQuotedTermKit' :: HasBuiltins m => m (Maybe QuotedTermKit)
+getQuotedTermKit' = runMaybeT $ do
+  qkitHidden     <- getB builtinHidden
+  qkitInstance   <- getB builtinInstance
+  qkitVisible    <- getB builtinVisible
+  qkitRelevant   <- getB builtinRelevant
+  qkitIrrelevant <- getB builtinIrrelevant
+  qkitArg        <- getB builtinArgArg
+  qkitArgInfo    <- getB builtinArgArgInfo
+  qkitNil        <- getB builtinNil
+  qkitCons       <- getB builtinCons
+  qkitVar        <- getB builtinAgdaTermVar
+  qkitDef        <- getB builtinAgdaTermDef
+  qkitCon        <- getB builtinAgdaTermCon
+  qkitMeta       <- getB builtinAgdaTermMeta
+  qkitLam        <- getB builtinAgdaTermLam
+  qkitExtLam     <- getB builtinAgdaTermExtLam
+  qkitPi         <- getB builtinAgdaTermPi
+  qkitSort       <- getB builtinAgdaTermSort
+  pure QuotedTermKit{..}
+  where
+    getB b = MaybeT $ getBuiltin' b
+
+-- | Do one level of quoting, revealing the top-level reflected constructor.
+quotedTermConstructorForm :: HasBuiltins m => QuotedTerm -> m Term
+quotedTermConstructorForm q =
+  caseMaybeM getQuotedTermKit'
+             __IMPOSSIBLE__ $ \ kit ->
+    pure $ quotedTermConstructorForm' kit q
+
+quotedTermConstructorForm' :: QuotedTermKit -> QuotedTerm -> Term
+quotedTermConstructorForm' QuotedTermKit{..} q =
+  case unSpine $ quotedTerm q of
+    Var x es     -> do
+      qkitVar $* [Lit (LitNat noRange $ fromIntegral x), quoteArgs es]
+    Def f es     ->
+      qkitDef $* [Lit (LitQName noRange f), quoteArgs es]  -- TODO: pattern lambdas!
+    Con ch ci es ->
+      qkitCon $* [Lit (LitQName noRange $ conName ch), quoteArgs es]
+    MetaV m es   -> __IMPOSSIBLE__
+    Lit l        -> __IMPOSSIBLE__
+    Lam h b      -> __IMPOSSIBLE__
+    Pi a b       -> __IMPOSSIBLE__
+    Sort s       -> __IMPOSSIBLE__
+    Level l      -> __IMPOSSIBLE__
+    DontCare t   -> __IMPOSSIBLE__
+    Dummy err es -> __IMPOSSIBLE__
+  where
+    quoteHiding :: Hiding -> Term
+    quoteHiding Hidden     = qkitHidden
+    quoteHiding Instance{} = qkitInstance
+    quoteHiding NotHidden  = qkitVisible
+
+    quoteRelevance :: Relevance -> Term
+    quoteRelevance Relevant   = qkitRelevant
+    quoteRelevance Irrelevant = qkitIrrelevant
+    quoteRelevance NonStrict  = qkitRelevant
+
+    -- TODO: quote Quanity
+    quoteArgInfo :: ArgInfo -> Term
+    quoteArgInfo (ArgInfo h m _ _) =
+      qkitArgInfo $* [quoteHiding h, quoteRelevance (getRelevance m)]
+
+    quoteArg :: Arg Term -> Term
+    quoteArg (Arg info t) = qkitArg $* [quoteArgInfo info, t]
+
+    quoteArgs :: Elims -> Term
+    quoteArgs es = list $ map (quoteArg . fmap quoted) vs
+      where vs = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
+
+    list :: [Term] -> Term
+    list = foldr (\ a as -> qkitCons $* [a, as]) qkitNil
+
+    ($*) :: Apply a => a -> [Term] -> a
+    ($*) = applys
+
+    ($$) :: Apply a => a -> Term -> a
+    ($$) = apply1
+
+    quoted :: Term -> Term
+    quoted v = Lit $ LitTerm noRange $ QuotedTerm Nothing v Nothing
+
 
 ---------------------------------------------------------------------------
 -- * The names of built-in things
